@@ -1,0 +1,172 @@
+apply plugin: 'groovy'
+apply plugin: 'war'
+apply plugin: 'tomcat-base'
+
+import org.apache.tools.ant.filters.*
+
+buildscript {
+    repositories {
+        jcenter()
+        maven { url "https://build.shibboleth.net/nexus/content/groups/public" }
+        maven { url "https://build.shibboleth.net/nexus/content/repositories/releases" }
+    }
+
+    dependencies {
+        classpath("edu.internet2.middleware:shibboleth-identityprovider:${project."shibboleth-idp.version"}") {
+            exclude module: "xercesImpl"
+        }
+        classpath "net.shibboleth.tool:ant-extensions:1.0.0"
+        classpath 'org.gradle.api.plugins:gradle-tomcat-plugin:1.2.3'
+    }
+}
+
+configurations {
+    testable
+    antConfig
+}
+
+task unpackageShibboleth << {
+    project.configurations.testable.each { dep ->
+        if (dep.name.startsWith("shibboleth-identityprovider")) {
+            copy {
+                from tarTree(resources.gzip(dep))
+                into temporaryDir
+            }
+            println "temporaryDir: ${temporaryDir}"
+        }
+    }
+}
+
+unpackageShibboleth.dependsOn "clean"
+unpackageShibboleth.outputs.dir unpackageShibboleth.temporaryDir
+
+task installShibboleth {
+    dependsOn "unpackageShibboleth"
+    outputs.dir temporaryDir
+    doLast {
+        def baseDir = "${unpackageShibboleth.outputs.files.asPath}/shibboleth-identityprovider-${project."shibboleth-idp.version"}"
+        def installerDir = "${baseDir}/src/installer"
+        def resourcesDir = "${installerDir}/resources"
+        def webappDir = "${baseDir}/src/main/webapp"
+
+        def entityId = "urn:shib-test:localhost"
+        def keystorePassword = "letmein"
+
+        def idpHomePath = temporaryDir as String
+
+        ['bin', 'conf', 'credentials', 'lib', 'lib/endorsed', 'logs', 'metadata', 'war'].each {
+            project.file("${idpHomePath}/${it}").mkdirs()
+        }
+        ant.selfSignedCert(hostname: "localhost",
+                uriSubjectAltNames: entityId,
+                certificateLifetime: 20,
+                privateKeyFile: "${idpHomePath}/credentials/idp.key",
+                certificateFile: "${idpHomePath}/credentials/idp.crt",
+                keystoreFile: "${idpHomePath}/credentials/idp.jks",
+                keystorePassword: keystorePassword
+        )
+        copy {
+            into "${idpHomePath}/conf"
+            from "${resourcesDir}/conf-tmpl"
+            filter ReplaceTokens, beginToken: '$', endToken: '$', tokens: [
+                    'IDP_HOME'       : idpHomePath,
+                    'IDP_VERSION'    : project."shibboleth-idp.version",
+                    'IDP_ENTITY_IDP' : entityId,
+                    'IDP_SCOPE'      : 'localhost',
+                    'IDP_CERTIFICATE': file("${idpHomePath}/credentials/idp.crt").text,
+                    'IDP_HOSTNAME'   : 'localhost'
+            ]
+        }
+
+        def idpCert = (file("${idpHomePath}/credentials/idp.crt").text =~ /\A.*-----\s((?:.*\s)*)-----END.*\Z/)[0][1]
+        copy {
+            into "${idpHomePath}/metadata"
+            from "${resourcesDir}/metadata-tmpl"
+            filter ReplaceTokens, beginToken: '$', endToken: '$', tokens: [
+                    'IDP_ENTITY_IDP' : entityId,
+                    'IDP_SCOPE'      : 'localhost',
+                    'IDP_CERTIFICATE': idpCert,
+                    'IDP_HOSTNAME'   : 'localhost'
+            ]
+        }
+
+        ['lib': 'lib', 'lib/endorsed': 'endorsed'].each { intoDir, fromDir ->
+            copy {
+                into "${idpHomePath}/${intoDir}"
+                from "${baseDir}/${fromDir}"
+            }
+        }
+
+        copy {
+            from "${webappDir}/WEB-INF/web.xml", { filter ReplaceTokens, beginToken: '$', endToken: '$', tokens: ['IDP_HOME': "file:${idpHomePath}" as String]}
+            into "${idpHomePath}/war"
+        }
+    }
+}
+
+war {
+    def baseDir = "${unpackageShibboleth.outputs.files.asPath}/shibboleth-identityprovider-${project."shibboleth-idp.version"}"
+    def webappDir = "${baseDir}/src/main/webapp"
+    def idpHome = installShibboleth.outputs.files.asPath as String
+
+    baseName "idp"
+    classpath fileTree("${baseDir}/lib") {
+        exclude "servlet-api*.jar"
+        exclude "jsp-api*.jar"
+    }
+    from "${webappDir}", { exclude "WEB-INF/**" }
+    webInf {
+        from "${webappDir}/WEB-INF", { exclude "web.xml" }
+    }
+    webXml = file ("${idpHome}/war/web.xml")
+}
+
+war.dependsOn "installShibboleth"
+
+repositories {
+    mavenCentral()
+    maven { url "https://build.shibboleth.net/nexus/content/groups/public" }
+    maven { url "https://build.shibboleth.net/nexus/content/repositories/releases" }
+}
+
+dependencies {
+    compile "org.codehaus.groovy:groovy-all:2.3.0"
+    testable(group: "edu.internet2.middleware", name: "shibboleth-identityprovider", version: project."shibboleth-idp.version", classifier: "bin", ext: "tar.gz") {
+        transitive false
+    }
+
+    antConfig("edu.internet2.middleware:shibboleth-identityprovider:${project."shibboleth-idp.version"}") {
+        exclude module: "xercesImpl"
+    }
+    antConfig "net.shibboleth.tool:ant-extensions:1.0.0"
+
+    ["core", "logging-juli", "jasper"].each {
+        tomcat("org.apache.tomcat.embed:tomcat-embed-${it}:${project."tomcat.version"}") {
+            exclude group: "org.eclipse.jdt.core.compiler", module: "ecj"
+        }
+    }
+    tomcat "xerces:xercesImpl:2.10.0"
+
+    testCompile "org.spockframework:spock-core:${project."spock.version"}"
+}
+
+// ant.taskdef(resource: 'net/sf/antcontrib/antlib.xml', classpath: configurations.antConfig.asPath)
+ant.taskdef resource: 'edu/internet2/middleware/ant/antlib.xml', classpath: configurations.antConfig.asPath
+
+ext {
+    tomcatStopPort = 8081
+    tomcatStopKey = 'stopKey'
+}
+
+task tomcatRun(type: org.gradle.api.plugins.tomcat.tasks.TomcatRunWar) {
+    stopPort = tomcatStopPort
+    stopKey = tomcatStopKey
+    daemon = true
+    enableSSL = true
+    configFile = file("etc/idp.xml")
+}
+
+task tomcatStop(type: org.gradle.api.plugins.tomcat.tasks.TomcatStop) {
+    stopPort = tomcatStopPort
+    stopKey = tomcatStopKey
+}
